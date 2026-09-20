@@ -3,7 +3,7 @@ package recloudstream
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
-import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbUrl
+import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
@@ -20,147 +20,116 @@ class AnimeDekhoProvider : MainAPI() {
         TvType.AsianDrama
     )
 
+    private val userAgent = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+
     override val mainPage = mainPageOf(
-        "$mainUrl/" to "Home",
-        "$mainUrl/movie-hindi/page/%d/" to "Movies",
-        "$mainUrl/series-hindi/page/%d/" to "Series",
-        "$mainUrl/genre/hindi-dub/page/%d/" to "Hindi Dub",
-        "$mainUrl/genre/multi-audio/page/%d/" to "Multi Audio"
+        "$mainUrl/home/page/%d/" to "Home",
+        "$mainUrl/category/anime/page/%d/" to "Anime",
+        "$mainUrl/category/hindi-dub/page/%d/" to "Hindi Dub",
+        "$mainUrl/category/cartoon/page/%d/" to "Cartoon",
+        "$mainUrl/category/tamil/page/%d/" to "Tamil",
+        "$mainUrl/category/telugu/page/%d/" to "Telugu"
     )
 
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        val document = app.get(request.data.format(page)).document
-        val home = document.select("article.item, div.movies-grid > a, div.item").mapNotNull {
-            it.toSearchResult()
-        }
+        val document = app.get(
+            request.data.format(page),
+            headers = mapOf("User-Agent" to userAgent)
+        ).document
+        val home = document.select("article.post.dfx.fcl.movies, div.post.dfx.fcl.movies, article.post")
+            .mapNotNull { it.toSearchResult() }
         return newHomePageResponse(request.name, home)
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
-        val anchor = if (this.tagName() == "a") this else this.selectFirst("a") ?: return null
+        val anchor = selectFirst("a") ?: return null
         val href = anchor.attr("href")
         if (href.isBlank()) return null
 
-        val title = this.selectFirst("h2, h3, .entry-title, .title")?.text()
-            ?: this.selectFirst("img")?.attr("alt")
+        val title = selectFirst(".entry-title, h2, h3")?.text()
+            ?: selectFirst("img")?.attr("alt")
             ?: anchor.text()
         if (title.isBlank()) return null
 
-        val poster = this.selectFirst("img")?.let {
-            it.attr("src").ifBlank { it.attr("data-src") }.ifBlank { it.attr("data-lazy-src") }
+        val poster = selectFirst(".post-thumbnail img, img")?.let {
+            it.attr("src").ifBlank { it.attr("data-src") }
+                .ifBlank { it.attr("data-lazy-src") }
         }
 
-        val cleanTitle = title
-            .replace(Regex("(?i)\\(Hindi Dubbed\\)"), "")
-            .replace(Regex("(?i)Download "), "")
-            .trim()
-
-        return newMovieSearchResponse(cleanTitle, href, TvType.Movie) {
+        return newMovieSearchResponse(title.trim(), href, TvType.Movie) {
             this.posterUrl = poster
         }
     }
 
     override suspend fun search(query: String, page: Int): SearchResponseList? {
         val encoded = URLEncoder.encode(query, "UTF-8")
-        val document = app.get("$mainUrl/?s=$encoded&page=$page").document
+        val url = if (page == 1) "$mainUrl/?s=$encoded" else "$mainUrl/page/$page/?s=$encoded"
+        val document = app.get(url, headers = mapOf("User-Agent" to userAgent)).document
 
-        val results = document.select("article.item, div.result-item, div.movies-grid > a, div.item").mapNotNull {
-            it.toSearchResult()
-        }
+        val results = document.select("article.post.dfx.fcl.movies, div.post.dfx.fcl.movies, article.post")
+            .mapNotNull { it.toSearchResult() }
         return newSearchResponseList(results)
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        val fixedUrl = fixUrl(url).substringBefore("#")
-        val document = app.get(fixedUrl).document
+        val document = app.get(url, headers = mapOf("User-Agent" to userAgent)).document
 
-        val rawTitle = document.selectFirst("h1.entry-title, h1, title")?.text()
+        val title = document.selectFirst("h1.entry-title, h1")?.text()?.trim()
             ?: return null
-        val title = rawTitle
-            .replace(Regex("(?i)\\(Hindi Dubbed\\)"), "")
-            .replace(Regex("(?i)Download "), "")
-            .replace(Regex("(?i)Watch Online.*"), "")
-            .trim()
+        val poster = document.selectFirst("meta[property=og:image]")?.attr("content")
+            ?: document.selectFirst("div.poster img, .post-thumbnail img")?.attr("src")
+        val plot = document.selectFirst("div.description p, .wp-content p, [itemprop=description]")?.text()?.trim()
 
-        val poster = document.selectFirst("div.poster img, meta[property=og:image], article img")?.let {
-            if (it.tagName() == "meta") it.attr("content") else it.attr("src").ifBlank { it.attr("data-src") }
-        }
-
-        val background = document.selectFirst("div.backdrop img, meta[property=og:image]")?.let {
-            if (it.tagName() == "meta") it.attr("content") else it.attr("src")
-        } ?: poster
-
-        val description = document.selectFirst("div.description, div.wp-content p, div[itemprop=description] p, p.synopsis")?.text()
-            ?.trim()
-            ?.takeIf { it.isNotBlank() }
-
-        val imdbUrl = document.selectFirst("a[href*=\"imdb.com/title/\"]")?.attr("href")
-
-        val genre = document.select("div.sgeneros a, div.genres a, span.genre a").map { it.text().trim() }
-            .filter { it.isNotBlank() }
-
-        val cast = document.select("div.person-list, div.cast-list, li[itemprop=actor]").map {
-            it.text().trim()
-        }.filter { it.isNotBlank() }
-
-        val yearText = document.selectFirst("span.year, span.date, div.metaitems span")?.text() ?: ""
+        val genre = document.select("div.sgeneros a, .genres a").map { it.text().trim() }.filter { it.isNotBlank() }
+        val cast = document.select("[itemprop=actor] .name, .cast-list li").map { it.text().trim() }.filter { it.isNotBlank() }
+        val yearText = document.selectFirst("span.year, [itemprop=datePublished]")?.text() ?: ""
         val year = Regex("""\d{4}""").find(yearText)?.value?.toIntOrNull()
+        val rating = document.selectFirst("[itemprop=ratingValue]")?.text()?.toDoubleOrNull()
 
-        val ratingText = document.selectFirst("span[itemprop=ratingValue], div.rating strong, span.dt_rating_vgs")?.text() ?: ""
-        val rating = ratingText.toDoubleOrNull()
-
-        val isSeries = document.selectFirst("div.episodios, div.seasons, div.episode-list, ul.episodios, div[class*=seasons]") != null
-                || fixedUrl.contains("/series", true)
+        // Detect series
+        val isSeries = document.selectFirst("div.episodios, ul.episodios, div.episode-list") != null
+                || url.contains("/series", true) || url.contains("/episode", true)
 
         if (isSeries) {
-            val episodeList = document.select("div.episodios ul li, div.episode-list li, ul.episodios li, article.episodio")
-            val episodes = episodeList.mapIndexedNotNull { index, ep ->
+            val epList = document.select("div.episodios li, ul.episodios li, .episode-list li, article.episodio")
+            val episodes = epList.mapIndexedNotNull { idx, ep ->
                 val a = ep.selectFirst("a") ?: return@mapIndexedNotNull null
-                val epUrl = a.attr("href")
-                if (epUrl.isBlank()) return@mapIndexedNotNull null
-
-                val epTitle = ep.selectFirst("h3, h2, .episodiotitle a, .title")?.text()?.trim()
-                val epNum = Regex("""(\d+)""").find(ep.selectFirst(".numerando, .num, span")?.text() ?: "")?.groupValues?.get(1)?.toIntOrNull()
-                    ?: (index + 1)
-                val epImg = ep.selectFirst("img")?.attr("src").orEmpty()
-
+                val epUrl = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapIndexedNotNull null
+                val epName = ep.selectFirst(".episodiotitle a, h3, .title")?.text()?.trim() ?: "Episode ${idx + 1}"
+                val epNum = Regex("""(\d+)""").find(ep.selectFirst(".numerando, .num")?.text() ?: "")?.groupValues?.get(1)?.toIntOrNull() ?: (idx + 1)
                 newEpisode(epUrl) {
-                    this.name = epTitle ?: "Episode $epNum"
+                    this.name = epName
                     this.episode = epNum
-                    this.posterUrl = epImg.ifBlank { null }
                 }
             }
-
             return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                 this.posterUrl = poster
-                this.backgroundPosterUrl = background
-                this.plot = description
+                this.plot = plot
                 this.tags = genre
                 this.year = year
                 this.score = rating?.let { Score.from10(it) }
                 addActors(cast)
-                if (imdbUrl != null) addImdbUrl(imdbUrl)
             }
         } else {
-            val buttons = document.select("a.btn, a[href*=\"#\"], div.download-links a, p.download-links a")
-                .filter { it.text().contains(Regex("(?i)(GDFlix|Hubcloud|NeoCDN|MirrorBot|VidCloud|HydraX|VidStream|SRuby|Omega)", RegexOption.IGNORE_CASE)) }
-                .mapNotNull { btn ->
-                    val link = btn.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                    EpisodeLink(link)
+            // Movie - extract dl1.php links
+            val links = document.select("a.button45, a[href*=dl1.php], a[href*=dl2.php]")
+                .mapNotNull { a ->
+                    val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                    val label = a.text().trim().ifBlank { a.selectFirst("span")?.text()?.trim() ?: "Download" }
+                    EpisodeLink(href, label)
                 }
+                .distinctBy { it.url }
 
-            return newMovieLoadResponse(title, url, TvType.Movie, buttons) {
+            return newMovieLoadResponse(title, url, TvType.Movie, links) {
                 this.posterUrl = poster
-                this.backgroundPosterUrl = background
-                this.plot = description
+                this.plot = plot
                 this.tags = genre
                 this.year = year
                 this.score = rating?.let { Score.from10(it) }
                 addActors(cast)
-                if (imdbUrl != null) addImdbUrl(imdbUrl)
             }
         }
     }
@@ -171,20 +140,66 @@ class AnimeDekhoProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val sources = try {
-            AppUtils.parseJson<ArrayList<EpisodeLink>>(data).map { it.source }
+        val links = try {
+            AppUtils.parseJson<ArrayList<EpisodeLink>>(data)
         } catch (e: Exception) {
-            listOf(data)
+            listOf(EpisodeLink(data, "Link"))
         }
 
-        sources.amap { source ->
-            val cleanSource = source.substringBefore("#")
-            loadExtractor(cleanSource, mainUrl, subtitleCallback, callback)
+        links.amap { link ->
+            resolveDownload(link.url, link.name, subtitleCallback, callback)
         }
         return true
     }
 
+    private suspend fun resolveDownload(
+        url: String,
+        label: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val headers = mapOf("User-Agent" to userAgent, "Referer" to mainUrl)
+
+        // Follow redirect chain
+        val first = app.get(url, headers = headers, allowRedirects = false)
+        val loc1 = first.headers["location"] ?: first.headers["Location"]
+        val next = loc1 ?: url
+
+        val second = app.get(next, headers = headers, allowRedirects = false)
+        val loc2 = second.headers["location"] ?: second.headers["Location"]
+        val third = loc2 ?: next
+
+        val finalDoc = app.get(third, headers = headers).document
+
+        // Extract embed iframe or redirect target
+        finalDoc.selectFirst("iframe[src]")?.let { iframe ->
+            val src = iframe.attr("src").takeIf { it.isNotBlank() } ?: return@let
+            loadExtractor(src, mainUrl, subtitleCallback, callback)
+            return
+        }
+
+        // Extract window.open JS
+        val scripts = finalDoc.select("script").map { it.data() }.joinToString("\n")
+        val openMatch = Regex("""window\.open\(\s*["']([^"']+)["']""").find(scripts)
+        openMatch?.groupValues?.get(1)?.let { openUrl ->
+            loadExtractor(openUrl, mainUrl, subtitleCallback, callback)
+            return
+        }
+
+        // Direct video URL fallback
+        val direct = Regex("""https?://[^\s"'<>]+(?:\.m3u8|\.mp4)[^\s"'<>]*""").find(scripts)?.value
+        if (direct != null) {
+            callback.invoke(
+                newExtractorLink("AnimeDekho", "AnimeDekho - $label", direct, ExtractorLinkType.VIDEO) {
+                    this.referer = mainUrl
+                    this.quality = getQualityFromName(label)
+                }
+            )
+        }
+    }
+
     data class EpisodeLink(
-        val source: String
+        val url: String,
+        val name: String
     )
 }
