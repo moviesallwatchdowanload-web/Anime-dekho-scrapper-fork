@@ -32,7 +32,6 @@ class AnimeDekhoProvider : MainAPI() {
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
-        // Card anchor link is inside a.lnk-blk
         val anchor = selectFirst("a.lnk-blk") ?: selectFirst("a") ?: return null
         val href = anchor.attr("href").ifBlank { selectFirst(".watch-btn")?.attr("href") ?: "" }
         if (href.isBlank()) return null
@@ -69,13 +68,12 @@ class AnimeDekhoProvider : MainAPI() {
         val genre = document.select("ul.details-lst li span a").map { it.text().trim() }.filter { it.isNotBlank() }
         val year = Regex("""\d{4}""").find(document.selectFirst(".entry-meta .year, span.year")?.text() ?: "")?.value?.toIntOrNull()
 
-        // Series detection — .seasons-bx with ul.seasons-lst exists
+        // Series detection — .seasons-bx exists
         val seasonsContainer = document.select("div.seasons-bx")
         if (seasonsContainer.isNotEmpty()) {
             val episodes = mutableListOf<Episode>()
 
             seasonsContainer.forEach { seasonBox ->
-                // Season number
                 val seasonText = seasonBox.selectFirst(".seasons-tt p span")?.text()?.trim() ?: "1"
                 val seasonNum = seasonText.toIntOrNull() ?: if (seasonText.equals("Special", true)) 0 else 1
 
@@ -84,10 +82,8 @@ class AnimeDekhoProvider : MainAPI() {
                     val epUrl = epAnchor.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
 
                     val epTitle = li.selectFirst("h3.title")?.text()?.trim() ?: ""
-                    // Parse S1-E1 from h3 span
                     val epNum = Regex("""(?i)E(\d+)""").find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
                         ?: (episodes.size + 1)
-
                     val epPoster = li.selectFirst("figure img")?.attr("src")
 
                     episodes.add(
@@ -109,7 +105,7 @@ class AnimeDekhoProvider : MainAPI() {
             }
         }
 
-        // Movie — extract button45 links
+        // Movie or Episode page — extract button45 links (with their labels)
         val links = document.select("a.button45").mapNotNull { a ->
             val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val label = a.text().trim().ifBlank { "Download" }
@@ -132,76 +128,86 @@ class AnimeDekhoProvider : MainAPI() {
         }
 
         links.amap { link ->
-            resolveServerLink(link.url, subtitleCallback, callback)
+            resolveServerLink(link.url, link.name, subtitleCallback, callback)
         }
         return true
     }
 
-    private suspend fun resolveServerLink(url: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+    private suspend fun resolveServerLink(
+        url: String,
+        label: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
         val headers = mapOf("User-Agent" to userAgent, "Referer" to mainUrl)
 
-        // dl1.php or dl2.php — follow the chain
-        if (url.contains("dl1.php") || url.contains("dl2.php")) {
+        var currentUrl = url
+        var depth = 0
+
+        // Follow redirect chain up to 5 hops
+        while (depth < 5) {
             try {
-                val resp = app.get(url, headers = headers, allowRedirects = false)
+                val resp = app.get(currentUrl, headers = headers, allowRedirects = false)
                 val location = resp.headers["location"] ?: resp.headers["Location"]
 
                 if (!location.isNullOrBlank()) {
-                    // Recursively follow redirect
-                    resolveServerLink(location, subtitleCallback, callback)
-                } else {
-                    // No redirect — maybe it's a final page with iframe
-                    val doc = resp.document
-                    val iframeSrc = doc.selectFirst("iframe[src]")?.attr("src")
-                    if (!iframeSrc.isNullOrBlank()) {
+                    currentUrl = location
+                    depth++
+                    continue
+                }
+
+                // No redirect — check if final page has an iframe or extractor URL
+                val body = resp.text
+
+                // Check if URL itself is an extractor (gdflix, etc.)
+                if (currentUrl.contains("gdflix", true) ||
+                    currentUrl.contains("hubcloud", true) ||
+                    currentUrl.contains("gdrive", true)) {
+                    loadExtractor(currentUrl, mainUrl, subtitleCallback, callback)
+                    return
+                }
+
+                // Check iframe in body
+                val iframeMatch = Regex("""<iframe[^>]+src=["']([^"']+)["']""").find(body)
+                if (iframeMatch != null) {
+                    val iframeSrc = iframeMatch.groupValues[1]
+                    if (iframeSrc.isNotBlank() && !iframeSrc.startsWith("about:")) {
                         loadExtractor(iframeSrc, mainUrl, subtitleCallback, callback)
+                        return
                     }
                 }
-            } catch (e: Exception) {
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
-            }
-        }
-        // gdflix.dev or gdflix.io — built-in CloudStream extractor
-        else if (url.contains("gdflix", true)) {
-            loadExtractor(url, mainUrl, subtitleCallback, callback)
-        }
-        // aaa/myth/dl.php — follow it
-        else if (url.contains("/aaa/myth/dl.php") || url.contains("/dl.php")) {
-            try {
-                val resp = app.get(url, headers = headers, allowRedirects = false)
-                val location = resp.headers["location"] ?: resp.headers["Location"]
-                if (!location.isNullOrBlank()) {
-                    resolveServerLink(location, subtitleCallback, callback)
-                } else {
-                    val doc = resp.document
-                    val iframeSrc = doc.selectFirst("iframe[src]")?.attr("src")
-                    if (!iframeSrc.isNullOrBlank()) {
-                        loadExtractor(iframeSrc, mainUrl, subtitleCallback, callback)
-                    }
+
+                // Check window.open
+                val openMatch = Regex("""window\.open\(\s*["']([^"']+)["']""").find(body)
+                if (openMatch != null && openMatch.groupValues[1].isNotBlank()) {
+                    loadExtractor(openMatch.groupValues[1], mainUrl, subtitleCallback, callback)
+                    return
                 }
-            } catch (e: Exception) {
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
-            }
-        }
-        // Embed page — extract iframe
-        else if (url.contains("/embed/")) {
-            try {
-                val doc = app.get(url, headers = headers).document
-                val iframeSrc = doc.selectFirst("iframe[src]")?.attr("src")
-                if (!iframeSrc.isNullOrBlank()) {
-                    loadExtractor(iframeSrc, mainUrl, subtitleCallback, callback)
-                } else {
-                    // Fallback — try direct embed URL
-                    loadExtractor(url, mainUrl, subtitleCallback, callback)
+
+                // Check direct video file
+                val videoMatch = Regex("""https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*""").find(body)
+                if (videoMatch != null) {
+                    callback.invoke(
+                        newExtractorLink("AnimeDekho", "AnimeDekho - $label", videoMatch.value, ExtractorLinkType.VIDEO) {
+                            this.referer = mainUrl
+                            this.quality = getQualityFromName(label)
+                        }
+                    )
+                    return
                 }
+
+                // Fallback — try extractor on current URL
+                loadExtractor(currentUrl, mainUrl, subtitleCallback, callback)
+                return
             } catch (e: Exception) {
-                loadExtractor(url, mainUrl, subtitleCallback, callback)
+                // On error, try extractor on last URL
+                loadExtractor(currentUrl, mainUrl, subtitleCallback, callback)
+                return
             }
         }
-        // Default: try extractor directly
-        else {
-            loadExtractor(url, mainUrl, subtitleCallback, callback)
-        }
+
+        // Depth exceeded — try extractor anyway
+        loadExtractor(currentUrl, mainUrl, subtitleCallback, callback)
     }
 
     data class EpisodeLink(val url: String, val name: String)
