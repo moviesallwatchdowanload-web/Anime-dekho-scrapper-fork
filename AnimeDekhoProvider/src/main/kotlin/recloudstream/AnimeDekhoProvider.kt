@@ -1,5 +1,6 @@
 package recloudstream
 
+import java.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
@@ -61,7 +62,7 @@ class AnimeDekhoProvider : MainAPI() {
         val genre = document.select("ul.details-lst li span a").map { it.text().trim() }.filter { it.isNotBlank() }
         val year = Regex("""\d{4}""").find(document.selectFirst(".entry-meta .year, span.year")?.text() ?: "")?.value?.toIntOrNull()
 
-        // Series detection
+        // Series — has seasons
         val seasonsContainer = document.select("div.seasons-bx")
         if (seasonsContainer.isNotEmpty()) {
             val episodes = mutableListOf<Episode>()
@@ -90,14 +91,34 @@ class AnimeDekhoProvider : MainAPI() {
             }
         }
 
-        // Movie / Episode page — button45 links
-        val links = document.select("a.button45").mapNotNull { a ->
-            val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            val label = a.text().trim().ifBlank { "Download" }
-            EpisodeLink(href, label)
+        // Movie OR Episode page — extract servers from ul.bx-lst (base64 data-src)
+        val servers = document.select("ul.bx-lst li a, ul.aa-tbs li a").mapNotNull { a ->
+            val encoded = a.attr("data-src").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val decoded = try {
+                String(Base64.getDecoder().decode(encoded))
+            } catch (e: Exception) {
+                return@mapNotNull null
+            }
+            val name = a.selectFirst(".num")?.text()?.trim() ?: "Server"
+            EpisodeLink(decoded, name)
         }.distinctBy { it.url }
 
-        return newMovieLoadResponse(title, url, TvType.Movie, links) {
+        // Fallback — button45 links (dl1.php chain) for movies
+        if (servers.isEmpty()) {
+            val dlLinks = document.select("a.button45").mapNotNull { a ->
+                val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                val label = a.text().trim().ifBlank { "Download" }
+                EpisodeLink(href, label)
+            }.distinctBy { it.url }
+            return newMovieLoadResponse(title, url, TvType.Movie, dlLinks) {
+                this.posterUrl = poster
+                this.plot = plot
+                this.tags = genre
+                this.year = year
+            }
+        }
+
+        return newMovieLoadResponse(title, url, TvType.Movie, servers) {
             this.posterUrl = poster
             this.plot = plot
             this.tags = genre
@@ -114,101 +135,140 @@ class AnimeDekhoProvider : MainAPI() {
 
         links.amap { link ->
             try {
-                resolveChain(link.url, link.name, subtitleCallback, callback)
+                resolveServerLink(link.url, link.name, subtitleCallback, callback)
             } catch (e: Exception) {
-                // swallow per-link error
+                // per-link error swallowed
             }
         }
         return true
     }
 
-    private suspend fun resolveChain(
-        startUrl: String,
+    private suspend fun resolveServerLink(
+        url: String,
         label: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val headers = mapOf(
-            "User-Agent" to userAgent,
-            "Referer" to mainUrl
-        )
+        val headers = mapOf("User-Agent" to userAgent, "Referer" to mainUrl)
 
-        var currentUrl = startUrl
-        var depth = 0
-        val visited = mutableSetOf<String>()
+        // Direct embed URL (VidStream case)
+        if (url.contains("/embed/")) {
+            try {
+                val doc = app.get(url, headers = headers).document
+                // Look for iframe/video/window.open inside
+                val iframeSrc = doc.selectFirst("iframe[src]")?.attr("src")
+                val videoSrc = Regex("""https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*""").find(doc.html())?.value
+                val openSrc = Regex("""window\.open\(\s*["']([^"']+)["']""").find(doc.html())?.groupValues?.get(1)
 
-        while (depth < 6 && !visited.contains(currentUrl)) {
-            visited.add(currentUrl)
-            depth++
-
-            // If URL is already a known extractor target → hand off
-            if (currentUrl.contains("gdflix", true) ||
-                currentUrl.contains("hubcloud", true) ||
-                currentUrl.contains("drivebot.sbs", true) ||
-                currentUrl.contains("filesgram", true)) {
-                loadExtractor(currentUrl, mainUrl, subtitleCallback, callback)
-                return
-            }
-
-            val resp = try {
-                app.get(currentUrl, headers = headers, allowRedirects = false)
-            } catch (e: Exception) {
-                // try as extractor on last URL
-                loadExtractor(currentUrl, mainUrl, subtitleCallback, callback)
-                return
-            }
-
-            val location = resp.headers["location"] ?: resp.headers["Location"]
-
-            if (!location.isNullOrBlank()) {
-                currentUrl = location
-                continue
-            }
-
-            // No redirect — final page. Extract iframe / window.open / direct video
-            val body = resp.text
-
-            // 1. iframe
-            val iframeMatch = Regex("""<iframe[^>]+src=["']([^"']+)["']""").find(body)
-            if (iframeMatch != null) {
-                val iframeSrc = iframeMatch.groupValues[1]
-                if (iframeSrc.isNotBlank() && !iframeSrc.startsWith("about:")) {
-                    loadExtractor(iframeSrc, mainUrl, subtitleCallback, callback)
-                    return
-                }
-            }
-
-            // 2. window.open
-            val openMatch = Regex("""window\.open\(\s*["']([^"']+)["']""").find(body)
-            if (openMatch != null && openMatch.groupValues[1].isNotBlank()) {
-                val openUrl = openMatch.groupValues[1]
-                if (openUrl.contains("gdflix", true) || openUrl.contains("hubcloud", true)) {
-                    loadExtractor(openUrl, mainUrl, subtitleCallback, callback)
-                    return
-                }
-                currentUrl = openUrl
-                continue
-            }
-
-            // 3. direct video
-            val videoMatch = Regex("""https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*""").find(body)
-            if (videoMatch != null) {
-                callback.invoke(
-                    newExtractorLink("AnimeDekho", "AnimeDekho - $label", videoMatch.value, ExtractorLinkType.VIDEO) {
-                        this.referer = mainUrl
-                        this.quality = getQualityFromName(label)
+                when {
+                    !iframeSrc.isNullOrBlank() && !iframeSrc.startsWith("about:") -> {
+                        loadExtractor(iframeSrc, mainUrl, subtitleCallback, callback)
                     }
-                )
+                    !videoSrc.isNullOrBlank() -> {
+                        callback.invoke(
+                            newExtractorLink("AnimeDekho", "AnimeDekho - $label", videoSrc, ExtractorLinkType.VIDEO) {
+                                this.referer = mainUrl
+                                this.quality = getQualityFromName(label)
+                            }
+                        )
+                    }
+                    !openSrc.isNullOrBlank() -> {
+                        loadExtractor(openSrc, mainUrl, subtitleCallback, callback)
+                    }
+                    else -> {
+                        // fallback
+                        loadExtractor(url, mainUrl, subtitleCallback, callback)
+                    }
+                }
+            } catch (e: Exception) {
+                loadExtractor(url, mainUrl, subtitleCallback, callback)
+            }
+            return
+        }
+
+        // dl1.php chain
+        if (url.contains("dl1.php") || url.contains("dl2.php") || url.contains("/dl.php") || url.contains("play.php")) {
+            var currentUrl = url
+            var depth = 0
+            val visited = mutableSetOf<String>()
+
+            while (depth < 6 && !visited.contains(currentUrl)) {
+                visited.add(currentUrl)
+                depth++
+
+                if (currentUrl.contains("gdflix", true) || currentUrl.contains("hubcloud", true)) {
+                    loadExtractor(currentUrl, mainUrl, subtitleCallback, callback)
+                    return
+                }
+
+                val resp = try {
+                    app.get(currentUrl, headers = headers, allowRedirects = false)
+                } catch (e: Exception) {
+                    loadExtractor(currentUrl, mainUrl, subtitleCallback, callback)
+                    return
+                }
+
+                val location = resp.headers["location"] ?: resp.headers["Location"]
+                if (!location.isNullOrBlank()) {
+                    currentUrl = location
+                    continue
+                }
+
+                val body = resp.text
+                val iframeMatch = Regex("""<iframe[^>]+src=["']([^"']+)["']""").find(body)
+                if (iframeMatch != null) {
+                    val iframeSrc = iframeMatch.groupValues[1]
+                    if (iframeSrc.isNotBlank() && !iframeSrc.startsWith("about:")) {
+                        loadExtractor(iframeSrc, mainUrl, subtitleCallback, callback)
+                        return
+                    }
+                }
+                val videoMatch = Regex("""https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*""").find(body)
+                if (videoMatch != null) {
+                    callback.invoke(
+                        newExtractorLink("AnimeDekho", "AnimeDekho - $label", videoMatch.value, ExtractorLinkType.VIDEO) {
+                            this.referer = mainUrl
+                            this.quality = getQualityFromName(label)
+                        }
+                    )
+                    return
+                }
+                loadExtractor(currentUrl, mainUrl, subtitleCallback, callback)
                 return
             }
-
-            // Fallback: try extractor on current URL
             loadExtractor(currentUrl, mainUrl, subtitleCallback, callback)
             return
         }
 
-        // Depth exceeded
-        loadExtractor(currentUrl, mainUrl, subtitleCallback, callback)
+        // Query-based URLs (MyCloud etc: https://animedekho.app/?trdekho=...)
+        if (url.contains("animedekho.app")) {
+            try {
+                val resp = app.get(url, headers = headers, allowRedirects = true)
+                val body = resp.text
+                val iframeMatch = Regex("""<iframe[^>]+src=["']([^"']+)["']""").find(body)
+                if (iframeMatch != null && iframeMatch.groupValues[1].isNotBlank()) {
+                    loadExtractor(iframeMatch.groupValues[1], mainUrl, subtitleCallback, callback)
+                    return
+                }
+                val videoMatch = Regex("""https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*""").find(body)
+                if (videoMatch != null) {
+                    callback.invoke(
+                        newExtractorLink("AnimeDekho", "AnimeDekho - $label", videoMatch.value, ExtractorLinkType.VIDEO) {
+                            this.referer = mainUrl
+                            this.quality = getQualityFromName(label)
+                        }
+                    )
+                    return
+                }
+                loadExtractor(resp.url, mainUrl, subtitleCallback, callback)
+            } catch (e: Exception) {
+                loadExtractor(url, mainUrl, subtitleCallback, callback)
+            }
+            return
+        }
+
+        // Default
+        loadExtractor(url, mainUrl, subtitleCallback, callback)
     }
 
     data class EpisodeLink(val url: String, val name: String)
