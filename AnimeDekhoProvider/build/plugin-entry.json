@@ -1,0 +1,25 @@
+{
+    "iconUrl": "https://animedekho.app/favicon.ico",
+    "jarFileSize": 68382,
+    "fileHash": "sha256-6de2b7d8b51e8969e0845a7b37da0af646a3a03ff3b151fdd6c5ce6cfc0fecb5",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/moviesallwatchdowanload-web/Anime-dekho-scrapper-fork",
+    "fileSize": 18085,
+    "status": 1,
+    "authors": [
+        "moviesallwatchdowanload-web"
+    ],
+    "tvTypes": [
+        "Movie",
+        "TvSeries",
+        "Anime",
+        "AsianDrama"
+    ],
+    "version": 1,
+    "internalName": "AnimeDekhoProvider",
+    "jarUrl": "https://raw.githubusercontent.com/moviesallwatchdowanload-web/Anime-dekho-scrapper-fork/builds/AnimeDekhoProvider.jar",
+    "description": "AnimeDekho - Hindi Dubbed Anime Movies & Series",
+    "url": "https://raw.githubusercontent.com/moviesallwatchdowanload-web/Anime-dekho-scrapper-fork/builds/AnimeDekhoProvider.cs3",
+    "name": "AnimeDekhoProvider",
+    "jarHash": "sha256-97535799e6511fdf857370843d9f508c0c32a1345f13a732871316c7bccf004a"
+}
