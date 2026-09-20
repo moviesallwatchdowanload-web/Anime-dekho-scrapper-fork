@@ -1,8 +1,7 @@
 {
     "name": "AnimeDekho Repo",
-    "description": "AnimeDekho Cloudstream Extension",
     "manifestVersion": 1,
     "pluginLists": [
-      "https://raw.githubusercontent.com/moviesallwatchdowanload-web/Anime-dekho-scrapper-fork/master/plugins.json"
+      "https://raw.githubusercontent.com/moviesallwatchdowanload-web/Anime-dekho-scrapper-fork/builds/plugins.json"
     ]
-
+}
