@@ -27,98 +27,179 @@ class AnimeDekhoProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val document = app.get(request.data.format(page), headers = mapOf("User-Agent" to userAgent)).document
-        val home = document.select("article.post, div.post.dfx.fcl.movies, article.post.dfx.fcl.movies").mapNotNull { it.toSearchResult() }
+        val home = document.select("article.post").mapNotNull { it.toSearchResult() }
         return newHomePageResponse(request.name, home)
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
-        val anchor = selectFirst("a") ?: return null
-        val href = anchor.attr("href")
+        // Card anchor link is inside a.lnk-blk
+        val anchor = selectFirst("a.lnk-blk") ?: selectFirst("a") ?: return null
+        val href = anchor.attr("href").ifBlank { selectFirst(".watch-btn")?.attr("href") ?: "" }
         if (href.isBlank()) return null
-        val title = selectFirst(".entry-title, h2, h3")?.text() ?: selectFirst("img")?.attr("alt") ?: anchor.text()
+
+        val title = selectFirst(".entry-title")?.text()?.trim()
+            ?: selectFirst("img")?.attr("alt")
+            ?: return null
         if (title.isBlank()) return null
+
         val poster = selectFirst(".post-thumbnail img, img")?.let {
             it.attr("src").ifBlank { it.attr("data-src") }.ifBlank { it.attr("data-lazy-src") }
         }
-        return newMovieSearchResponse(title.trim(), href, TvType.Movie) { this.posterUrl = poster }
+
+        return newMovieSearchResponse(title, href, TvType.Movie) {
+            this.posterUrl = poster
+        }
     }
 
     override suspend fun search(query: String, page: Int): SearchResponseList? {
         val encoded = URLEncoder.encode(query, "UTF-8")
         val url = if (page == 1) "$mainUrl/?s=$encoded" else "$mainUrl/page/$page/?s=$encoded"
         val document = app.get(url, headers = mapOf("User-Agent" to userAgent)).document
-        val results = document.select("article.post, div.post.dfx.fcl.movies, article.post.dfx.fcl.movies").mapNotNull { it.toSearchResult() }
+        val results = document.select("article.post").mapNotNull { it.toSearchResult() }
         return newSearchResponseList(results)
     }
 
     override suspend fun load(url: String): LoadResponse? {
         val document = app.get(url, headers = mapOf("User-Agent" to userAgent)).document
+
         val title = document.selectFirst("h1.entry-title, h1")?.text()?.trim() ?: return null
-        val poster = document.selectFirst("meta[property=og:image]")?.attr("content") ?: document.selectFirst("div.poster img, .post-thumbnail img")?.attr("src")
-        val plot = document.selectFirst("div[itemprop=description], .wp-content p, div.description, .entry-content p")?.text()?.trim()
-        val genre = document.select("div.sgeneros a, .genres a, .entry-meta a").map { it.text().trim() }.filter { it.isNotBlank() && it.length < 30 }
-        val yearText = document.selectFirst("span.year, .entry-meta .year")?.text() ?: ""
-        val year = Regex("""\d{4}""").find(yearText)?.value?.toIntOrNull()
+        val poster = document.selectFirst("meta[property=og:image]")?.attr("content")
+            ?: document.selectFirst("div.poster img, .post-thumbnail img")?.attr("src")
+        val plot = document.selectFirst("div[itemprop=description], .wp-content p, .entry-content p")?.text()?.trim()
+        val genre = document.select("ul.details-lst li span a").map { it.text().trim() }.filter { it.isNotBlank() }
+        val year = Regex("""\d{4}""").find(document.selectFirst(".entry-meta .year, span.year")?.text() ?: "")?.value?.toIntOrNull()
 
-        val episodeRegex = Regex("""(?i)^S\d+-E\d+""")
-        val episodeAnchors = document.select("a").filter { a -> episodeRegex.containsMatchIn(a.text().trim()) }
+        // Series detection — .seasons-bx with ul.seasons-lst exists
+        val seasonsContainer = document.select("div.seasons-bx")
+        if (seasonsContainer.isNotEmpty()) {
+            val episodes = mutableListOf<Episode>()
 
-        if (episodeAnchors.isNotEmpty()) {
-            val episodes = episodeAnchors.mapIndexed { idx, a ->
-                val epUrl = a.attr("href").takeIf { it.isNotBlank() } ?: ""
-                val epName = a.text().trim()
-                val s = Regex("""(?i)S(\d+)-""").find(epName)?.groupValues?.get(1)?.toIntOrNull() ?: 1
-                val e = Regex("""(?i)E(\d+)""").find(epName)?.groupValues?.get(1)?.toIntOrNull() ?: (idx + 1)
-                newEpisode(epUrl) { this.name = epName; this.season = s; this.episode = e }
+            seasonsContainer.forEach { seasonBox ->
+                // Season number
+                val seasonText = seasonBox.selectFirst(".seasons-tt p span")?.text()?.trim() ?: "1"
+                val seasonNum = seasonText.toIntOrNull() ?: if (seasonText.equals("Special", true)) 0 else 1
+
+                seasonBox.select("ul.seasons-lst li").forEach { li ->
+                    val epAnchor = li.selectFirst("a.btn.sm.rnd, a") ?: return@forEach
+                    val epUrl = epAnchor.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
+
+                    val epTitle = li.selectFirst("h3.title")?.text()?.trim() ?: ""
+                    // Parse S1-E1 from h3 span
+                    val epNum = Regex("""(?i)E(\d+)""").find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
+                        ?: (episodes.size + 1)
+
+                    val epPoster = li.selectFirst("figure img")?.attr("src")
+
+                    episodes.add(
+                        newEpisode(epUrl) {
+                            this.name = epTitle
+                            this.season = seasonNum
+                            this.episode = epNum
+                            this.posterUrl = epPoster
+                        }
+                    )
+                }
             }
+
             return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-                this.posterUrl = poster; this.plot = plot; this.tags = genre; this.year = year
+                this.posterUrl = poster
+                this.plot = plot
+                this.tags = genre
+                this.year = year
             }
-        } else {
-            val links = document.select("a.button45, a.buttondl, .buttondl a, a[href*=dl1.php], a[href*=dl2.php]")
-                .mapNotNull { a ->
-                    val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                    val label = a.text().trim().ifBlank { "Download" }
-                    EpisodeLink(href, label)
-                }.distinctBy { it.url }
-            return newMovieLoadResponse(title, url, TvType.Movie, links) {
-                this.posterUrl = poster; this.plot = plot; this.tags = genre; this.year = year
-            }
+        }
+
+        // Movie — extract button45 links
+        val links = document.select("a.button45").mapNotNull { a ->
+            val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val label = a.text().trim().ifBlank { "Download" }
+            EpisodeLink(href, label)
+        }.distinctBy { it.url }
+
+        return newMovieLoadResponse(title, url, TvType.Movie, links) {
+            this.posterUrl = poster
+            this.plot = plot
+            this.tags = genre
+            this.year = year
         }
     }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        val links = try { AppUtils.parseJson<ArrayList<EpisodeLink>>(data) } catch (e: Exception) { listOf(EpisodeLink(data, "Link")) }
-        links.amap { link -> resolveLink(link.url, link.name, subtitleCallback, callback) }
+        val links = try {
+            AppUtils.parseJson<ArrayList<EpisodeLink>>(data)
+        } catch (e: Exception) {
+            listOf(EpisodeLink(data, "Link"))
+        }
+
+        links.amap { link ->
+            resolveServerLink(link.url, subtitleCallback, callback)
+        }
         return true
     }
 
-    private suspend fun resolveLink(url: String, label: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+    private suspend fun resolveServerLink(url: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val headers = mapOf("User-Agent" to userAgent, "Referer" to mainUrl)
-        if (url.contains("dl1.php") || url.contains("dl2.php") || url.contains("dl.php")) {
+
+        // dl1.php or dl2.php — follow the chain
+        if (url.contains("dl1.php") || url.contains("dl2.php")) {
             try {
-                val resp = app.get(url, headers = headers, allowRedirects = true)
-                val body = resp.text
-                val iframeMatch = Regex("""<iframe[^>]+src=["']([^"']+)["']""").find(body)
-                if (iframeMatch != null && iframeMatch.groupValues[1].isNotBlank()) {
-                    loadExtractor(iframeMatch.groupValues[1], mainUrl, subtitleCallback, callback); return
+                val resp = app.get(url, headers = headers, allowRedirects = false)
+                val location = resp.headers["location"] ?: resp.headers["Location"]
+
+                if (!location.isNullOrBlank()) {
+                    // Recursively follow redirect
+                    resolveServerLink(location, subtitleCallback, callback)
+                } else {
+                    // No redirect — maybe it's a final page with iframe
+                    val doc = resp.document
+                    val iframeSrc = doc.selectFirst("iframe[src]")?.attr("src")
+                    if (!iframeSrc.isNullOrBlank()) {
+                        loadExtractor(iframeSrc, mainUrl, subtitleCallback, callback)
+                    }
                 }
-                val openMatch = Regex("""window\.open\(\s*["']([^"']+)["']""").find(body)
-                if (openMatch != null && openMatch.groupValues[1].isNotBlank()) {
-                    loadExtractor(openMatch.groupValues[1], mainUrl, subtitleCallback, callback); return
-                }
-                val videoMatch = Regex("""https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*""").find(body)
-                if (videoMatch != null) {
-                    callback.invoke(newExtractorLink("AnimeDekho", "AnimeDekho - $label", videoMatch.value, ExtractorLinkType.VIDEO) {
-                        this.referer = mainUrl
-                        this.quality = getQualityFromName(label)
-                    }); return
-                }
-                loadExtractor(resp.url, mainUrl, subtitleCallback, callback)
             } catch (e: Exception) {
                 loadExtractor(url, mainUrl, subtitleCallback, callback)
             }
-        } else {
+        }
+        // gdflix.dev or gdflix.io — built-in CloudStream extractor
+        else if (url.contains("gdflix", true)) {
+            loadExtractor(url, mainUrl, subtitleCallback, callback)
+        }
+        // aaa/myth/dl.php — follow it
+        else if (url.contains("/aaa/myth/dl.php") || url.contains("/dl.php")) {
+            try {
+                val resp = app.get(url, headers = headers, allowRedirects = false)
+                val location = resp.headers["location"] ?: resp.headers["Location"]
+                if (!location.isNullOrBlank()) {
+                    resolveServerLink(location, subtitleCallback, callback)
+                } else {
+                    val doc = resp.document
+                    val iframeSrc = doc.selectFirst("iframe[src]")?.attr("src")
+                    if (!iframeSrc.isNullOrBlank()) {
+                        loadExtractor(iframeSrc, mainUrl, subtitleCallback, callback)
+                    }
+                }
+            } catch (e: Exception) {
+                loadExtractor(url, mainUrl, subtitleCallback, callback)
+            }
+        }
+        // Embed page — extract iframe
+        else if (url.contains("/embed/")) {
+            try {
+                val doc = app.get(url, headers = headers).document
+                val iframeSrc = doc.selectFirst("iframe[src]")?.attr("src")
+                if (!iframeSrc.isNullOrBlank()) {
+                    loadExtractor(iframeSrc, mainUrl, subtitleCallback, callback)
+                } else {
+                    // Fallback — try direct embed URL
+                    loadExtractor(url, mainUrl, subtitleCallback, callback)
+                }
+            } catch (e: Exception) {
+                loadExtractor(url, mainUrl, subtitleCallback, callback)
+            }
+        }
+        // Default: try extractor directly
+        else {
             loadExtractor(url, mainUrl, subtitleCallback, callback)
         }
     }
